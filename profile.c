@@ -37,11 +37,6 @@
  *
 \*****************************************************************************/
 
-/*   acct_gather_profile_none
- * This plugin does not initiate a node-level thread.
- * It is the acct_gather_profile stub.
- */
-
 #include "src/common/slurm_xlator.h"
 #include "src/common/slurm_jobacct_gather.h"
 #include "src/common/slurm_protocol_api.h"
@@ -125,14 +120,15 @@ union data_t{
 	double	 d;
 };
 
-static slurm_mila_conf_t mila_conf;
+static          slurm_mila_conf_t mila_conf;
 static uint32_t g_profile_running = ACCT_GATHER_PROFILE_NOT_SET;
-static stepd_step_rec_t *g_job = NULL;
-static table_t *tables = NULL;
-static size_t tables_max_len = 0;
-static size_t tables_cur_len = 0;
+static          stepd_step_rec_t *g_job = NULL;
 
+// NVML variables
+static nvmlDevice_t* devices = NULL;
+static uint32_t      device_count = 0;
 
+// Metrics we will populate
 static acct_gather_profile_dataset_t new_dataset_fields[] = {
     { "GPUFrequency", PROFILE_FIELD_DOUBLE },
     { "GPUMem", PROFILE_FIELD_DOUBLE },
@@ -154,6 +150,7 @@ extern int init(void)
 	debug("%s loaded", plugin_name);
     CHK(nvmlInitWithFlags(NVML_INIT_FLAG_NO_GPUS));
 
+    // CHK(nvmlDeviceSetAccountingMode());
 	return SLURM_SUCCESS;
 }
 
@@ -291,8 +288,18 @@ extern int acct_gather_profile_p_node_step_start(stepd_step_rec_t* job)
     // This is where we can handle the --profile=%s options
     // we are not interested in this yet
     xassert(_run_in_daemon());
-    
     g_job = job;
+
+    // Get device the job has access to;
+    // dump environment
+    char **iter = job->env;
+
+	while (*iter != NULL) {
+		size_t n = strlen(*iter);
+
+        printf("%s=%s\n", *iter, iter[n + 1]);
+		iter += 1;
+	}
 
 	return SLURM_SUCCESS;
 }
@@ -388,6 +395,7 @@ extern int acct_gather_profile_p_add_sample_data(int dataset_id, void* data,
         i += 1;
     }
     // ---
+    debug("gather GPU info %d", dataset_id);
     // uint32_t ntasks = g_job->ntasks;
     // stepd_step_task_info_t* task = g_job->task[];
     pid_t pid = g_job->jobacct->pid;
