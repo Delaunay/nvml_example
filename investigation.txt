@@ -1,0 +1,94 @@
+
+
+
+	enum {
+		FIELD_CPUFREQ,
+		FIELD_CPUTIME,
+		FIELD_CPUUTIL,
+		FIELD_RSS,
+		FIELD_VMSIZE,
+		FIELD_PAGES,
+		FIELD_READ,
+		FIELD_WRITE,
+        FIELD_GPU_COMPUTE,
+        FIELD_GPU_MEMORY,
+        FIELD_GPU_POWER,
+		FIELD_CNT
+	};
+
+	acct_gather_profile_dataset_t dataset[] = {
+		{ "CPUFrequency", PROFILE_FIELD_UINT64 },
+		{ "CPUTime", PROFILE_FIELD_DOUBLE },
+		{ "CPUUtilization", PROFILE_FIELD_DOUBLE },
+		{ "RSS", PROFILE_FIELD_UINT64 },
+		{ "VMSize", PROFILE_FIELD_UINT64 },
+		{ "Pages", PROFILE_FIELD_UINT64 },
+		{ "ReadMB", PROFILE_FIELD_DOUBLE },
+		{ "WriteMB", PROFILE_FIELD_DOUBLE },
+        { "GPUCompute", PROFILE_FIELD_DOUBLE },
+        { "GPUMem", PROFILE_FIELD_DOUBLE },
+        { "GPUPower", PROFILE_FIELD_DOUBLE },
+		{ NULL, PROFILE_FIELD_NOT_SET }
+	};
+
+
+
+jobacct_gather_cgroup = 
+
+
+jag_common_poll_data(
+	List task_list, bool pgid_plugin, uint64_t cont_id,
+	jag_callbacks_t *callbacks, bool profile) {
+
+
+    if (profile){
+        static void _record_profile(struct jobacctinfo *jobacct){
+            acct_gather_profile_g_create_group("Tasks");
+
+            acct_gather_profile_g_create_dataset(ds_name, profile_gid, dataset);
+
+            acct_gather_profile_g_add_sample_data(jobacct->dataset_id, (void *)data, jobacct->cur_time);
+        }
+    }
+}
+
+typedef struct {
+	uint32_t taskid; /* contains which task number it was on */
+	uint32_t nodeid; /* contains which node number it was on */
+	stepd_step_rec_t *job; /* contains stepd job pointer */
+} jobacct_id_t;
+
+stepd_step_rec_t *job https://github.com/SchedMD/slurm/blob/2cefac420ad369416caaef65255cd5705936370e/src/slurmd/slurmstepd/slurmstepd_job.h#L125
+
+job = jobacct_id->job;
+uid = job->uid;         // user ID
+
+
+
+typedef struct jag_prec {	/* process record */
+	bool	visited;
+	int	act_cpufreq;	/* actual average cpu frequency */
+	int	last_cpu;	/* last cpu */
+	pid_t	pid;
+	pid_t	ppid;
+	double  ssec; /* system cpu time: To normalize divide by system hertz */
+	/* Units of tres_[in|out] should be raw numbers (bytes/joules) */
+	int     tres_count; /* count of tres in the tres_data */
+	acct_gather_data_t *tres_data; /* array of tres data */
+	double  usec; /* user cpu time: To normalize divide by system hertz */
+} jag_prec_t;
+
+
+typedef struct acct_gather_data {
+	uint64_t	num_reads;  /* count of reads */
+	uint64_t	num_writes; /* count of writes */
+	uint64_t	size_read;  /* raw amount read (in) */
+	uint64_t	size_write; /* raw amount written (out) */
+} acct_gather_data_t;
+
+
+
+
+
+
+
