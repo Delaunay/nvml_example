@@ -1,13 +1,16 @@
 /*****************************************************************************\
- *  acct_gather_profile_none.c - slurm profile accounting plugin for none.
+ *  acct_gather_profile_mila.c - slurm accounting plugin for mila
+ *				     profiling.
  *****************************************************************************
- *  Copyright (C) 2013 Bull S. A. S.
- *		Bull, Rue Jean Jaures, B.P.68, 78340, Les Clayes-sous-Bois.
+ *  Author: Pierre Delaunay
+ *  Copyright (C) 2019
  *
- *  Written by Rod Schultz <rod.schultz@bull.com>
+ *  Based on the HDF5 profiling plugin and Elasticsearch job completion plugin.
+ *
+ *  Portions Copyright (C) 2013 SchedMD LLC.
  *
  *  This file is part of Slurm, a resource management program.
- *  For details, see <https://slurm.schedmd.com>.
+ *  For details, see <http://www.schedmd.com/slurmdocs/>.
  *  Please also read the included file: DISCLAIMER.
  *
  *  Slurm is free software; you can redistribute it and/or modify it under
@@ -35,26 +38,34 @@
  *  with Slurm; if not, write to the Free Software Foundation, Inc.,
  *  51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA.
  *
-\*****************************************************************************/
+ *  This file is patterned after jobcomp_linux.c, written by Morris Jette and
+ *  Copyright (C) 2002 The Regents of the University of California.
+ \*****************************************************************************/
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/types.h>
+#include <sys/un.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <inttypes.h>
+#include <unistd.h>
+#include <pwd.h>
+#include <math.h>
+
+#include <nvml.h>
+#include <curl/curl.h>
 
 #include "src/common/slurm_xlator.h"
-#include "src/common/slurm_jobacct_gather.h"
+#include "src/common/fd.h"
+#include "src/common/slurm_acct_gather_profile.h"
 #include "src/common/slurm_protocol_api.h"
 #include "src/common/slurm_protocol_defs.h"
+#include "src/common/slurm_time.h"
+#include "src/common/macros.h"
 #include "src/slurmd/common/proctrack.h"
-#include "src/common/slurm_acct_gather_profile.h"
 
-#include <unistd.h>
-#include <string.h>
-#include <fcntl.h>
-#include <signal.h>
-#include <pwd.h>
-
-#include <curl/curl.h>
-#include <nvml.h>
-
-
-#define _DEBUG 1
 
 /*
  * These variables are required by the generic plugin interface.  If they
@@ -81,27 +92,22 @@
  * plugin_version - an unsigned 32-bit integer containing the Slurm version
  * (major.minor.micro combined into a single number).
  */
-const char plugin_name[] = "AcctGatherProfile GPU plugin";
-const char plugin_type[] = "acct_gather_profile/mila_gpu";
+const char plugin_name[] = "AcctGatherProfile mila plugin";
+const char plugin_type[] = "acct_gather_profile/mila";
+const uint32_t plugin_version = SLURM_VERSION_NUMBER;
+
+const uint32_t version = 2;
+FILE* log_file = NULL;
 
 
-int check(nvmlReturn_t error, const char *file, const char *fun, int line, const char *call_str) 
-{
-    if (error != NVML_SUCCESS) {
-        debug("[!] %s/%s:%d %s %s\n", file, fun, line, nvmlErrorString(error), call_str);
-        return 0;
-    };
-    return 1;
-}
-#define CHK(X) check(X, __FILE__, __func__, __LINE__, #X)
-
-enum {
-    FIELD_GPUFREQ,  // 1.8 Ghz
-    FIELD_GPUMEM,   // Mem in Mo
-    FIELD_GPUUTIL,  // Util %
-    FIELD_GPUPOWER, // Power usage
-	FIELD_CNT
-};
+typedef struct {
+	char *host;
+	char *database;
+	uint32_t def;
+	char *password;
+	char *rt_policy;
+	char *username;
+} slurm_mila_conf_t;
 
 typedef struct {
 	char ** names;
@@ -111,79 +117,75 @@ typedef struct {
 } table_t;
 
 typedef struct {
-    uint32_t def;
-	char *dir;
-} slurm_mila_conf_t;
+    const char* name;
+    float value;
+} metric_t;
+
+/* Type for handling HTTP responses */
+struct http_response {
+	char *message;
+	size_t size;
+};
 
 union data_t{
 	uint64_t u;
 	double	 d;
 };
 
-static          slurm_mila_conf_t mila_conf;
+static slurm_mila_conf_t mila_conf;
 static uint32_t g_profile_running = ACCT_GATHER_PROFILE_NOT_SET;
-static          stepd_step_rec_t *g_job = NULL;
+static stepd_step_rec_t *g_job = NULL;
 
-// NVML variables
-static nvmlDevice_t* devices = NULL;
-static uint32_t      device_count = 0;
+static char *datastr = NULL;
+static int datastrlen = 0;
 
-// Metrics we will populate
-static acct_gather_profile_dataset_t new_dataset_fields[] = {
-    { "GPUFrequency", PROFILE_FIELD_DOUBLE },
-    { "GPUMem", PROFILE_FIELD_DOUBLE },
-    { "GPUUtilization", PROFILE_FIELD_DOUBLE },
-    { "GPUPower", PROFILE_FIELD_DOUBLE },
-	{ NULL, PROFILE_FIELD_NOT_SET }
-};
-// Offset storing where our GPU data starts in the dataset
-static uint32_t datasset_offset = 0;
-static acct_gather_profile_dataset_t* profile_dataset = NULL;
-static uint32_t profile_dataset_len = 0;
+static table_t *tables = NULL;
+static size_t tables_max_len = 0;
+static size_t tables_cur_len = 0;
 
-/*
- * init() is called when the plugin is loaded, before any other functions
- * are called.  Put global initialization here.
- */
-extern int init(void)
+static  nvmlDevice_t* job_devices = NULL;
+static size_t device_count = 0;
+
+static void _free_tables(void)
 {
-	debug("%s loaded", plugin_name);
-    CHK(nvmlInitWithFlags(NVML_INIT_FLAG_NO_GPUS));
+	int i, j;
 
-    // CHK(nvmlDeviceSetAccountingMode());
-	return SLURM_SUCCESS;
+        debug3("[MILA]" "%s %s called", plugin_type, __func__);
+
+	for (i = 0; i < tables_cur_len; i++) {
+		table_t *table = &(tables[i]);
+		for (j = 0; j < tables->size; j++)
+			xfree(table->names[j]);
+		xfree(table->name);
+		xfree(table->names);
+		xfree(table->types);
+	}
+	xfree(tables);
 }
 
-extern int fini(void)
+static uint32_t _determine_profile(void)
 {
-    CHK(nvmlShutdown());
-	return SLURM_SUCCESS;
+	uint32_t profile;
+
+        debug3("[MILA]" "%s %s called", plugin_type, __func__);
+	xassert(g_job);
+
+	if (g_profile_running != ACCT_GATHER_PROFILE_NOT_SET)
+		profile = g_profile_running;
+	else if (g_job->profile >= ACCT_GATHER_PROFILE_NONE)
+		profile = g_job->profile;
+	else
+                profile = mila_conf.def;
+
+	return profile;
 }
-
-/**
- * define the options this plugin is going to load
- */
-extern void acct_gather_profile_p_conf_options(s_p_options_t **full_options,
-					       int *full_options_cnt)
-{
-	debug3("%s %s called", plugin_type, __func__);
-
-	s_p_options_t options[] = {
-		{"ProfileMilaGpuDir", S_P_STRING},
-		{NULL} };
-
-	transfer_s_p_options(full_options, options, full_options_cnt);
-	return;
-}
-
-
 
 static bool _run_in_daemon(void)
 {
 	static bool set = false;
 	static bool run = false;
 
-	debug3("%s %s called", plugin_type, __func__);
+        debug3("[MILA]" "%s %s called", plugin_type, __func__);
 
 	if (!set) {
 		set = 1;
@@ -194,272 +196,593 @@ static bool _run_in_daemon(void)
 }
 
 
-/**
- * Read configuration file `acct_gather.conf` and set the configuration in `mila_conf`
- */
-extern void acct_gather_profile_p_conf_set(s_p_hashtbl_t *tbl)
+
+/* Callback to handle the HTTP response */
+static size_t _write_callback(void *contents, size_t size, size_t nmemb,
+			      void *userp)
 {
-	// char *tmp = NULL;
-	// _reset_slurm_profile_conf();
+	size_t realsize = size * nmemb;
+	struct http_response *mem = (struct http_response *) userp;
 
-	if (tbl) {
-		s_p_get_string(&mila_conf.dir, "ProfileMilaGpuDir", tbl);
-	}
+        debug3("[MILA]" "%s %s called", plugin_type, __func__);
 
-	if (!mila_conf.dir)
-		fatal("No ProfileMilaGpuDir in your acct_gather.conf file.  "
-		      "This is required to use the %s plugin", plugin_type);
+	mem->message = xrealloc(mem->message, mem->size + realsize + 1);
 
-	debug("%s loaded", plugin_name);
+	memcpy(&(mem->message[mem->size]), contents, realsize);
+	mem->size += realsize;
+	mem->message[mem->size] = 0;
+
+	return realsize;
 }
 
+/* Try to send data to mila */
+static int _send_data(const char *data)
+{
+    debug("[MILA]" "%s \n", data);
 
-/**
- * This is for people outside our pluging that wants to check its config.
- * it is quite useless as it seems the enum is just for HDF5 profiling.
- * better to use `acct_gather_profile_p_conf_values` instead
+        return 0;
+
+	CURL *curl_handle = NULL;
+	CURLcode res;
+	struct http_response chunk;
+	int rc = SLURM_SUCCESS;
+	long response_code;
+	static int error_cnt = 0;
+	char *url = NULL;
+	size_t length;
+
+        debug3("[MILA]" "%s %s called", plugin_type, __func__);
+
+	/*
+	 * Every compute node which is sampling data will try to establish a
+         * different connection to the mila server. In order to reduce the
+	 * number of connections, every time a new sampled data comes in, it
+	 * is saved in the 'datastr' buffer. Once this buffer is full, then we
+	 * try to open the connection and send this buffer, instead of opening
+	 * one per sample.
+	 */
+	if (data && ((datastrlen + strlen(data)) <= BUF_SIZE)) {
+		xstrcat(datastr, data);
+		length = strlen(data);
+		datastrlen += length;
+		if (slurm_get_debug_flags() & DEBUG_FLAG_PROFILE)
+                        info("[MILA]" "%s %s: %zu bytes of data added to buffer. New buffer size: %d",
+			     plugin_type, __func__, length, datastrlen);
+		return rc;
+	}
+
+	DEF_TIMERS;
+	START_TIMER;
+
+	if (curl_global_init(CURL_GLOBAL_ALL) != 0) {
+                error("[MILA]" "%s %s: curl_global_init: %m", plugin_type, __func__);
+		rc = SLURM_ERROR;
+		goto cleanup_global_init;
+	} else if ((curl_handle = curl_easy_init()) == NULL) {
+                error("[MILA]" "%s %s: curl_easy_init: %m", plugin_type, __func__);
+		rc = SLURM_ERROR;
+		goto cleanup_easy_init;
+	}
+
+        xstrfmtcat(url, "%s/write?db=%s&rp=%s&precision=s", mila_conf.host,
+                   mila_conf.database, mila_conf.rt_policy);
+
+	chunk.message = xmalloc(1);
+	chunk.size = 0;
+
+	curl_easy_setopt(curl_handle, CURLOPT_URL, url);
+        if (mila_conf.password)
+		curl_easy_setopt(curl_handle, CURLOPT_PASSWORD,
+                                 mila_conf.password);
+	curl_easy_setopt(curl_handle, CURLOPT_POST, 1);
+	curl_easy_setopt(curl_handle, CURLOPT_POSTFIELDS, datastr);
+	curl_easy_setopt(curl_handle, CURLOPT_POSTFIELDSIZE, strlen(datastr));
+        if (mila_conf.username)
+		curl_easy_setopt(curl_handle, CURLOPT_USERNAME,
+                                 mila_conf.username);
+	curl_easy_setopt(curl_handle, CURLOPT_WRITEFUNCTION, _write_callback);
+	curl_easy_setopt(curl_handle, CURLOPT_WRITEDATA, (void *) &chunk);
+
+	if ((res = curl_easy_perform(curl_handle)) != CURLE_OK) {
+		if ((error_cnt++ % 100) == 0)
+                        error("[MILA]" "%s %s: curl_easy_perform failed to send data (discarded). Reason: %s",
+			      plugin_type, __func__, curl_easy_strerror(res));
+		rc = SLURM_ERROR;
+		goto cleanup;
+	}
+
+	if ((res = curl_easy_getinfo(curl_handle, CURLINFO_RESPONSE_CODE,
+				     &response_code)) != CURLE_OK) {
+                error("[MILA]" "%s %s: curl_easy_getinfo response code failed: %s",
+		      plugin_type, __func__, curl_easy_strerror(res));
+		rc = SLURM_ERROR;
+		goto cleanup;
+	}
+
+	/* In general, status codes of the form 2xx indicate success,
+         * 4xx indicate that MilaDB could not understand the request, and
+	 * 5xx indicate that the system is overloaded or significantly impaired.
+	 * Errors are returned in JSON.
+         * https://docs.influxdata.com/mila/v0.13/concepts/api/
+	 */
+	if (response_code >= 200 && response_code <= 205) {
+                debug2("[MILA]" "%s %s: data write success", plugin_type, __func__);
+		if (error_cnt > 0)
+			error_cnt = 0;
+	} else {
+		rc = SLURM_ERROR;
+                debug2("[MILA]" "%s %s: data write failed, response code: %ld",
+		       plugin_type, __func__, response_code);
+		if (slurm_get_debug_flags() & DEBUG_FLAG_PROFILE) {
+			/* Strip any trailing newlines. */
+			while (chunk.message[strlen(chunk.message) - 1] == '\n')
+				chunk.message[strlen(chunk.message) - 1] = '\0';
+                        info("[MILA]" "%s %s: JSON response body: %s", plugin_type,
+			     __func__, chunk.message);
+		}
+	}
+
+cleanup:
+	xfree(chunk.message);
+	xfree(url);
+cleanup_easy_init:
+	curl_easy_cleanup(curl_handle);
+cleanup_global_init:
+	curl_global_cleanup();
+
+	END_TIMER;
+	if (slurm_get_debug_flags() & DEBUG_FLAG_PROFILE)
+                debug("[MILA]" "%s %s: took %s to send data", plugin_type, __func__,
+                      TIME_STR);  fflush(stdout);
+
+	if (data) {
+		datastr = xstrdup(data);
+		datastrlen = strlen(data);
+	} else {
+		datastr[0] = '\0';
+		datastrlen = 0;
+	}
+
+	return rc;
+}
+
+// check NVML return code
+int check(nvmlReturn_t error, const char *file, const char *fun, int line, const char *call_str)
+{
+    if (error != NVML_SUCCESS) {
+        debug("[!] %s/%s:%d %s %s\n", file, fun, line, nvmlErrorString(error), call_str);
+        fflush(stdout);
+        return 0;
+    };
+    return 1;
+}
+#define CHK(X) check(X, __FILE__, __func__, __LINE__, #X)
+
+/*
+ * init() is called when the plugin is loaded, before any other functions
+ * are called. Put global initialization here.
  */
+extern int init(void)
+{
+    log_file = fopen("/slurm/mila_plugin.log", "rw");
+    fprintf(log_file, "[MILA] %s %s called (v: %d)\n", plugin_type, __func__, version); 
+    fflush(log_file);
+
+        debug3("[MILA]" "%s %s called (v: %d)", plugin_type, __func__, version); 
+
+	if (!_run_in_daemon())
+                return SLURM_SUCCESS;
+
+        // NVML_INIT_FLAG_NO_GPUS
+        CHK(nvmlInit());
+	datastr = xmalloc(BUF_SIZE);
+	return SLURM_SUCCESS;
+}
+
+extern int fini(void)
+{
+        debug3("[MILA]" "%s %s called", plugin_type, __func__); fflush(stdout);
+        CHK(nvmlShutdown());
+
+	_free_tables();
+	xfree(datastr);
+        xfree(mila_conf.host);
+        xfree(mila_conf.database);
+        xfree(mila_conf.password);
+        xfree(mila_conf.rt_policy);
+        xfree(mila_conf.username);
+
+    fclose(log_file);
+	return SLURM_SUCCESS;
+}
+
+extern void acct_gather_profile_p_conf_options(s_p_options_t **full_options,
+					       int *full_options_cnt)
+{
+        debug3("[MILA]" "%s %s called", plugin_type, __func__); fflush(stdout);
+
+	s_p_options_t options[] = {
+                {"ProfileMilaDBHost", S_P_STRING},
+                {"ProfileMilaDBDatabase", S_P_STRING},
+                {"ProfileMilaDBDefault", S_P_STRING},
+                {"ProfileMilaDBPass", S_P_STRING},
+                {"ProfileMilaDBRTPolicy", S_P_STRING},
+                {"ProfileMilaDBUser", S_P_STRING},
+		{NULL} };
+
+	transfer_s_p_options(full_options, options, full_options_cnt);
+	return;
+}
+
+extern void acct_gather_profile_p_conf_set(s_p_hashtbl_t *tbl)
+{
+	char *tmp = NULL;
+
+        debug3("[MILA]" "%s %s called", plugin_type, __func__); fflush(stdout);
+
+        mila_conf.def = ACCT_GATHER_PROFILE_ALL;
+        //*
+	if (tbl) {
+                s_p_get_string(&mila_conf.host, "ProfileMilaDBHost", tbl);
+                if (s_p_get_string(&tmp, "ProfileMilaDBDefault", tbl)) {
+                        mila_conf.def =
+				acct_gather_profile_from_string(tmp);
+                        if (mila_conf.def == ACCT_GATHER_PROFILE_NOT_SET)
+                                fatal("[MILA]" "ProfileMilaDBDefault can not be set to %s, please specify a valid option",
+				      tmp);
+			xfree(tmp);
+		}
+                s_p_get_string(&mila_conf.database,
+                               "ProfileMilaDBDatabase", tbl);
+                s_p_get_string(&mila_conf.password,
+                               "ProfileMilaDBPass", tbl);
+                s_p_get_string(&mila_conf.rt_policy,
+                               "ProfileMilaDBRTPolicy", tbl);
+                s_p_get_string(&mila_conf.username,
+                               "ProfileMilaDBUser", tbl);
+        }
+        //*/
+        //*
+        if (!mila_conf.host)
+                fatal("[MILA]" "No ProfileMilaDBHost in your acct_gather.conf file. This is required to use the %s plugin",
+		      plugin_type);
+
+        if (!mila_conf.database)
+                fatal("[MILA]" "No ProfileMilaDBDatabase in your acct_gather.conf file. This is required to use the %s plugin",
+		      plugin_type);
+
+        if (mila_conf.password && !mila_conf.username)
+                fatal("[MILA]" "No ProfileMilaDBUser in your acct_gather.conf file. This is required if ProfileMilaDBPass is specified to use the %s plugin",
+		      plugin_type);
+
+        if (!mila_conf.rt_policy)
+                fatal("[MILA]" "No ProfileMilaDBRTPolicy in your acct_gather.conf file. This is required to use the %s plugin",
+		      plugin_type);
+        //*/
+
+        debug("[MILA]" "%s loaded", plugin_name); fflush(stdout);
+}
+
 extern void acct_gather_profile_p_get(enum acct_gather_profile_info info_type,
 				      void *data)
 {
 	uint32_t *uint32 = (uint32_t *) data;
-    char **tmp_char = (char **) data;
+	char **tmp_char = (char **) data;
+
+        debug3("[MILA]" "%s %s called", plugin_type, __func__); fflush(stdout);
 
 	switch (info_type) {
-    case ACCT_GATHER_PROFILE_DIR:
-        *tmp_char = xstrdup(mila_conf.dir);
+	case ACCT_GATHER_PROFILE_DIR:
+                *tmp_char = xstrdup(mila_conf.host);
 		break;
-
 	case ACCT_GATHER_PROFILE_DEFAULT:
-        *uint32 = mila_conf.def;
-        break;
-
+                *uint32 = mila_conf.def;
+		break;
 	case ACCT_GATHER_PROFILE_RUNNING:
 		*uint32 = g_profile_running;
 		break;
 	default:
-		break;
+                debug2("[MILA]" "%s %s: info_type %d invalid", plugin_type,
+                       __func__, info_type); fflush(stdout);
 	}
-
-	return;
 }
 
-/**
- * Export plugin configuration to hashtable
- */
-extern void acct_gather_profile_p_conf_values(List *data)
-{
-	config_key_pair_t *key_pair;
-	debug3("%s %s called", plugin_type, __func__);
-
-	xassert(*data);
-
-	key_pair = xmalloc(sizeof(config_key_pair_t));
-	key_pair->name = xstrdup("ProfileMilaGpuDir");
-	key_pair->value = xstrdup(mila_conf.dir);
-	list_append(*data, key_pair);
-
-    key_pair = xmalloc(sizeof(config_key_pair_t));
-	key_pair->name = xstrdup("ProfileMilaGpuDefault");
-	key_pair->value =
-		xstrdup(acct_gather_profile_to_string(mila_conf.def));
-	list_append(*data, key_pair);
-
-	return;
-}
-
-/**
- * force profiling 
- */
-extern bool acct_gather_profile_p_is_active(uint32_t type)
-{
-	return true;
-}
-
-/* Called once per step on each node from slurmstepd, before launching tasks.
- * Provides an opportunity to create files and other node-step level initialization. 
- */
 extern int acct_gather_profile_p_node_step_start(stepd_step_rec_t* job)
 {
-    // This is where we can handle the --profile=%s options
-    // we are not interested in this yet
-    xassert(_run_in_daemon());
-    g_job = job;
+	int rc = SLURM_SUCCESS;
+	char *profile_str;
 
-    // Get device the job has access to;
-    // dump environment
+        debug3("[MILA]" "%s %s called", plugin_type, __func__); fflush(stdout);
+
+	xassert(_run_in_daemon());
+
+	g_job = job;
+	profile_str = acct_gather_profile_to_string(g_job->profile);
+        debug2("[MILA]" "%s %s: option --profile=%s", plugin_type, __func__,
+               profile_str); fflush(stdout);
+
+    // Get the USED GPU!
+    job_devices = NULL;
+    device_count = 0;
+
     char **iter = job->env;
 
 	while (*iter != NULL) {
 		size_t n = strlen(*iter);
 
-        printf("%s=%s\n", *iter, iter[n + 1]);
+        debug3("[MILA] " "%s=%s\n", *iter, iter[n + 1]);
 		iter += 1;
 	}
 
-	return SLURM_SUCCESS;
-}
 
+	g_profile_running = _determine_profile();
+	return rc;
+}
 
 extern int acct_gather_profile_p_child_forked(void)
 {
+        debug3("[MILA]" "%s %s called", plugin_type, __func__); fflush(stdout);
 	return SLURM_SUCCESS;
 }
 
 extern int acct_gather_profile_p_node_step_end(void)
 {
-    /*
-    for(int i = 0; i < profile_dataset_len; i++){
-        xfree(profile_dataset[i].name);
-    }
-    xfree(profile_dataset);
-    */
-    
-	return SLURM_SUCCESS;
+	int rc = SLURM_SUCCESS;
+        debug3("[MILA]" "%s %s called", plugin_type, __func__); fflush(stdout);
+
+	xassert(_run_in_daemon());
+
+	return rc;
 }
 
-// 
 extern int acct_gather_profile_p_task_start(uint32_t taskid)
 {
-    xassert(_run_in_daemon());
-	xassert(g_job);
+	int rc = SLURM_SUCCESS;
 
-	return SLURM_SUCCESS;
+        debug3("[MILA]" "%s %s called with %d prof", plugin_type, __func__,
+               g_profile_running); fflush(stdout);
+
+	xassert(_run_in_daemon());
+	xassert(g_job);
+	xassert(g_profile_running != ACCT_GATHER_PROFILE_NOT_SET);
+
+        // ---
+	if (g_profile_running <= ACCT_GATHER_PROFILE_NONE)
+		return rc;
+
+	return rc;
 }
 
 extern int acct_gather_profile_p_task_end(pid_t taskpid)
 {
+        debug3("[MILA]" "%s %s called", plugin_type, __func__); fflush(stdout);
+
+	_send_data(NULL);
 	return SLURM_SUCCESS;
 }
 
-extern int acct_gather_profile_p_create_group(const char* name)
+extern int64_t acct_gather_profile_p_create_group(const char* name)
 {
-	return SLURM_SUCCESS;
+        debug3("[MILA]" "%s %s called", plugin_type, __func__); fflush(stdout);
+
+	return 0;
 }
 
-/**
- * void* data contains data that was gathered by the jobacct_gather call 
- *  `_record_profile`
- */
-extern int acct_gather_profile_p_add_sample_data(int dataset_id, void* data,
-						 time_t sample_time)
-{
-    debug("acct_gather_profile_p_add_sample_data %d", dataset_id);
-
-    acct_gather_profile_dataset_t* iter = profile_dataset;
-
-    struct passwd *pws;
-    pws = getpwuid(g_job->uid);
-    const char* username = pws->pw_name;
-
-    static const char* UINT64_FMT = 
-        "%s,user=%s,job=%d,step=%d,task=%s,host=%s value=%"PRIu64" %"PRIu64"\n";
-
-    static const char* DOUBLE_FMT = 
-        "%s,user=%s,job=%d,step=%d,task=%s,host=%s value=%"PRIu64" %"PRIu64"\n";
-
-    char *str = NULL;
-
-    int i = 0;
-    while(iter && iter->type != PROFILE_FIELD_NOT_SET){
-        switch(iter->type){
-            case PROFILE_FIELD_UINT64:
-                xstrfmtcat(str, UINT64_FMT, iter->name, username, 
-                    g_job->jobid, g_job->stepid, "Task", g_job->node_name, 
-                    ((union data_t*) data)[i].u
-                );
-                break;
-
-            case PROFILE_FIELD_DOUBLE:
-                xstrfmtcat(str, DOUBLE_FMT, iter->name, username, 
-                    g_job->jobid, g_job->stepid, "Task", g_job->node_name, 
-                    ((union data_t*) data)[i].d
-                );
-                break;
-
-            case PROFILE_FIELD_NOT_SET:
-                break;
-        }
-
-        iter += 1;
-        i += 1;
-    }
-    // ---
-    debug("gather GPU info %d", dataset_id);
-    // uint32_t ntasks = g_job->ntasks;
-    // stepd_step_task_info_t* task = g_job->task[];
-    pid_t pid = g_job->jobacct->pid;
-
-    // ---
-    xfree(str);
-	return SLURM_SUCCESS;
-}
-
-
-/**
- * acct_gather_profile_dataset_t is hardcoded in 
- * src/plugins/jobacct_gather/common/common_jag.c:741
- *
- */
 extern int acct_gather_profile_p_create_dataset(const char* name,
 						int64_t parent,
-						acct_gather_profile_dataset_t *dataset)
+						acct_gather_profile_dataset_t
+						*dataset)
 {
+	table_t * table;
+	acct_gather_profile_dataset_t *dataset_loc = dataset;
 
-    // Insert our fields inside the dataset 
-    // dataset = append_dataset(dataset, new_dataset_fields);
-    profile_dataset = dataset;
-    debug("acct_gather_profile_p_create_dataset %s", name); 
+        debug3("[MILA]" "%s %s called", plugin_type, __func__); fflush(stdout);
 
+	if (g_profile_running <= ACCT_GATHER_PROFILE_NONE)
+		return SLURM_ERROR;
 
-    return SLURM_SUCCESS;
+	/* compute the size of the type needed to create the table */
+	if (tables_cur_len == tables_max_len) {
+		if (tables_max_len == 0)
+			++tables_max_len;
+		tables_max_len *= 2;
+		tables = xrealloc(tables, tables_max_len * sizeof(table_t));
+	}
+
+	table = &(tables[tables_cur_len]);
+	table->name = xstrdup(name);
+	table->size = 0;
+
+	while (dataset_loc && (dataset_loc->type != PROFILE_FIELD_NOT_SET)) {
+		table->names = xrealloc(table->names,
+					(table->size+1) * sizeof(char *));
+		table->types = xrealloc(table->types,
+					(table->size+1) * sizeof(char *));
+		(table->names)[table->size] = xstrdup(dataset_loc->name);
+		switch (dataset_loc->type) {
+		case PROFILE_FIELD_UINT64:
+			table->types[table->size] =
+				PROFILE_FIELD_UINT64;
+			break;
+		case PROFILE_FIELD_DOUBLE:
+			table->types[table->size] =
+				PROFILE_FIELD_DOUBLE;
+			break;
+		case PROFILE_FIELD_NOT_SET:
+			break;
+		}
+		table->size++;
+		dataset_loc++;
+	}
+	++tables_cur_len;
+	return tables_cur_len - 1;
 }
 
-//
-acct_gather_profile_dataset_t* append_dataset(
-    acct_gather_profile_dataset_t* dataset, 
-    acct_gather_profile_dataset_t* new_fields)
-
+extern int acct_gather_profile_p_add_sample_data(int table_id, void *data,
+						 time_t sample_time)
 {
-    // this should only be called once
-    xassert(datasset_offset == 0);
-    xassert(profile_dataset == NULL);
+	table_t *table = &tables[table_id];
+	int i = 0;
+	char *str = NULL;
 
-    int current_size = 0;
-    int new_fields_size = 0;
+        debug3("[MILA]" "%s %s called", plugin_type, __func__); fflush(stdout);
 
-    acct_gather_profile_dataset_t* iter = dataset;
-    while(iter && iter->type != PROFILE_FIELD_NOT_SET){
-        current_size += 1;
-        iter += 1;
-    }
+        // get username
+        struct passwd *pws;
+        pws = getpwuid(g_job->uid);
+        const char* username = pws->pw_name;
 
-    iter = new_fields;
-    while(iter && iter->type != PROFILE_FIELD_NOT_SET){
-        new_fields_size += 1;
-        iter += 1;
-    }
+	for(; i < table->size; i++) {
+		switch (table->types[i]) {
+		case PROFILE_FIELD_UINT64:
+                        xstrfmtcat(str, "%s,user=%s,job=%d,step=%d,task=%s,"
+				   "host=%s value=%"PRIu64" "
+                                   "%"PRIu64"\n", table->names[i], username,
+				   g_job->jobid, g_job->stepid,
+				   table->name, g_job->node_name,
+				   ((union data_t*)data)[i].u,
+				   sample_time);
+			break;
+		case PROFILE_FIELD_DOUBLE:
+                        xstrfmtcat(str, "%s,user=%s,job=%d,step=%d,task=%s,"
+				   "host=%s value=%.2f %"PRIu64""
+                                   "\n", table->names[i], username,
+				   g_job->jobid, g_job->stepid,
+				   table->name, g_job->node_name,
+				   ((union data_t*)data)[i].d,
+				   sample_time);
+			break;
+		case PROFILE_FIELD_NOT_SET:
+			break;
+		}
+        }//*
+        debug3("[MILA]" "gather GPU info %d", table_id); fflush(stdout);
+        // pid_t pid = g_job->jobacct->pid;
 
-    profile_dataset_len = (new_fields_size + current_size + 1);
-    acct_gather_profile_dataset_t* merged = xmalloc(
-        sizeof(acct_gather_profile_dataset_t) * profile_dataset_len);
+        nvmlMemory_t mem_info;
+        nvmlUtilization_t util_info;
 
-    for(int i = 0; i < current_size; ++i){
-        merged[i].name = xstrdup(dataset[i].name);
-        merged[i].type = dataset[i].type;
-    }
+        unsigned int encode_util = 0; float encode_avg = 0;
+        unsigned int decode_util = 0; float decode_avg = 0;
+        unsigned int       power = 0; float  power_avg = 0;
 
-    for(int i = 0; i < new_fields_size; ++i){
-        int j = i + current_size;
+        float  used_memory = 0;
+        float total_memory = 0;
 
-        merged[j].name = xstrdup(dataset[i].name);
-        merged[j].type = dataset[i].type;
-    }
+        float    gpu_util = 0;
+        float memory_util = 0;
 
-    datasset_offset = current_size;
-    profile_dataset = merged;
-    return merged;
+        unsigned int sample_period = 0;
+
+        for(int i = 0; i < device_count; ++i){
+             nvmlDevice_t* device = job_devices[i];
+
+             // Benzina uses the encode/decode
+             CHK(nvmlDeviceGetEncoderUtilization(device, &encode_util, &sample_period));
+             encode_avg += (float) encode_util;
+
+             CHK(nvmlDeviceGetDecoderUtilization(device, &decode_util, &sample_period));
+             decode_avg += (float) decode_util;
+
+             CHK(nvmlDeviceGetMemoryInfo(device, &mem_info));
+             used_memory += (float) mem_info.used;
+             total_memory = (float) mem_info.total;
+
+             CHK(nvmlDeviceGetPowerUsage(device, &power));
+             power_avg += (float) power;
+
+             CHK(nvmlDeviceGetUtilizationRates(device, &util_info));
+             gpu_util += (float) util_info.gpu;
+             memory_util  += (float) util_info.memory;
+        }
+
+        if (device_count > 0){
+            encode_avg  /= (float) device_count;
+            decode_avg  /= (float) device_count;
+            used_memory /= (float) device_count;
+            power_avg   /= (float) device_count;
+            gpu_util    /= (float) device_count;
+            memory_util /= (float) device_count;
+
+            metric_t metrics[] = {
+                {"encode" , encode_avg},
+                {"decode" , decode_avg},
+                {"used"   , used_memory},
+                {"total"  , total_memory},
+                {"power"  , power_avg},
+                {"compute", gpu_util},
+                {"mem"    , memory_util}
+            };
+
+            for(int i = 0; i < sizeof(metrics); i++){
+                metric_t m = metrics[i];
+
+                xstrfmtcat(str, "%s,user=%s,job=%d,step=%d,task=%s,"
+                           "host=%s value=%.2f %"PRIu64""
+                           "\n", m.name, username,
+                           g_job->jobid, g_job->stepid,
+                           table->name, g_job->node_name,
+                           m.value,
+                           sample_time);
+            }
+        }
+
+        // GPU monitoring done
+        // ---------*/
+    debug3("[MILA]" "%s \n", str);
+
+        _send_data(str);
+	xfree(str);
+
+	return SLURM_SUCCESS;
 }
 
+extern void acct_gather_profile_p_conf_values(List *data)
+{
+	config_key_pair_t *key_pair;
 
+        debug3("[MILA]" "%s %s called", plugin_type, __func__); fflush(stdout);
+
+	xassert(*data);
+
+	key_pair = xmalloc(sizeof(config_key_pair_t));
+        key_pair->name = xstrdup("ProfileMilaDBHost");
+        key_pair->value = xstrdup(mila_conf.host);
+	list_append(*data, key_pair);
+
+	key_pair = xmalloc(sizeof(config_key_pair_t));
+        key_pair->name = xstrdup("ProfileMilaDBDatabase");
+        key_pair->value = xstrdup(mila_conf.database);
+	list_append(*data, key_pair);
+
+	key_pair = xmalloc(sizeof(config_key_pair_t));
+        key_pair->name = xstrdup("ProfileMilaDBDefault");
+	key_pair->value =
+                xstrdup(acct_gather_profile_to_string(mila_conf.def));
+	list_append(*data, key_pair);
+
+	key_pair = xmalloc(sizeof(config_key_pair_t));
+        key_pair->name = xstrdup("ProfileMilaDBPass");
+        key_pair->value = xstrdup(mila_conf.password);
+	list_append(*data, key_pair);
+
+	key_pair = xmalloc(sizeof(config_key_pair_t));
+        key_pair->name = xstrdup("ProfileMilaDBRTPolicy");
+        key_pair->value = xstrdup(mila_conf.rt_policy);
+	list_append(*data, key_pair);
+
+	key_pair = xmalloc(sizeof(config_key_pair_t));
+        key_pair->name = xstrdup("ProfileMilaDBUser");
+        key_pair->value = xstrdup(mila_conf.username);
+	list_append(*data, key_pair);
+
+	return;
+
+}
+
+extern bool acct_gather_profile_p_is_active(uint32_t type)
+{
+        debug3("[MILA]" "%s %s called", plugin_type, __func__); fflush(stdout);
+        return true;
+}
 
