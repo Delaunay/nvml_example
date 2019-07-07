@@ -58,7 +58,12 @@ typedef struct {
 	stepd_step_rec_t *job; /* contains stepd job pointer */
 } jobacct_id_t;
 
+
+//
 stepd_step_rec_t *job https://github.com/SchedMD/slurm/blob/2cefac420ad369416caaef65255cd5705936370e/src/slurmd/slurmstepd/slurmstepd_job.h#L125
+    * job_gres_list
+
+
 
 job = jobacct_id->job;
 uid = job->uid;         // user ID
@@ -119,6 +124,32 @@ typedef struct acct_gather_data {
         
 
 https://github.com/SchedMD/slurm/blob/ac1182cfffa2f66988fa3c71ed2dc12cb27581b0/src/common/gres.h#L172
+
+
+
+
+https://github.com/SchedMD/slurm/blob/27c9742d33262f188669a3419ce1bc6b36d7ff97/src/plugins/task/cgroup/task_cgroup_devices.c
+
+extern List gres_plugin_get_allocated_devices(List gres_list, bool is_job);
+
+device_list = gres_plugin_get_allocated_devices(job_gres_list, true);
+
+gres_device_t *gres_device;
+
+device_list = gres_plugin_get_allocated_devices(step_gres_list, false);
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 

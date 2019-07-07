@@ -54,13 +54,8 @@ RUN mkdir -p /var/run/munge
 ADD slurm.conf /etc/slurm/slurm.conf
 ADD cgroup.conf /etc/slurm/cgroup.conf
 ADD acct_gather.conf /etc/slurm/acct_gather.conf
+ADD start_slurm.sh /workspace/start_slurm.sh
 
 ENV SLURM_CONF=/etc/slurm/slurm.conf
-
-# authentication deamon
-# munged
-# slurmctld
-# slurmd 
-
 
 
