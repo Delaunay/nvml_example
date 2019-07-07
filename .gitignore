@@ -1,3 +1,5 @@
 *.out
 nvml_stat
+build/
+slurm/
 

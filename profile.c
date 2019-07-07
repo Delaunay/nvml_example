@@ -138,7 +138,7 @@ static acct_gather_profile_dataset_t new_dataset_fields[] = {
 };
 // Offset storing where our GPU data starts in the dataset
 static uint32_t datasset_offset = 0;
-static acct_gather_profile_dataset_t* profile_dataset = NULL:
+static acct_gather_profile_dataset_t* profile_dataset = NULL;
 static uint32_t profile_dataset_len = 0;
 
 /*
@@ -158,11 +158,6 @@ extern int fini(void)
 {
     CHK(nvmlShutdown());
 	return SLURM_SUCCESS;
-}
-
-extern void acct_gather_profile_p_conf_set(s_p_hashtbl_t *tbl)
-{
-	return;
 }
 
 /**
@@ -204,8 +199,8 @@ static bool _run_in_daemon(void)
  */
 extern void acct_gather_profile_p_conf_set(s_p_hashtbl_t *tbl)
 {
-	char *tmp = NULL;
-	_reset_slurm_profile_conf();
+	// char *tmp = NULL;
+	// _reset_slurm_profile_conf();
 
 	if (tbl) {
 		s_p_get_string(&mila_conf.dir, "ProfileMilaGpuDir", tbl);
@@ -228,6 +223,7 @@ extern void acct_gather_profile_p_get(enum acct_gather_profile_info info_type,
 				      void *data)
 {
 	uint32_t *uint32 = (uint32_t *) data;
+    char **tmp_char = (char **) data;
 
 	switch (info_type) {
     case ACCT_GATHER_PROFILE_DIR:
@@ -341,12 +337,6 @@ extern int acct_gather_profile_p_create_group(const char* name)
 	return SLURM_SUCCESS;
 }
 
-extern int acct_gather_profile_p_create_dataset(
-	const char* name, int parent, acct_gather_profile_dataset_t *dataset)
-{
-	return SLURM_SUCCESS;
-}
-
 /**
  * void* data contains data that was gathered by the jobacct_gather call 
  *  `_record_profile`
@@ -376,14 +366,14 @@ extern int acct_gather_profile_p_add_sample_data(int dataset_id, void* data,
             case PROFILE_FIELD_UINT64:
                 xstrfmtcat(str, UINT64_FMT, iter->name, username, 
                     g_job->jobid, g_job->stepid, "Task", g_job->node_name, 
-                    ((union data_t*) data)[i].u, 
+                    ((union data_t*) data)[i].u
                 );
                 break;
 
             case PROFILE_FIELD_DOUBLE:
                 xstrfmtcat(str, DOUBLE_FMT, iter->name, username, 
                     g_job->jobid, g_job->stepid, "Task", g_job->node_name, 
-                    ((union data_t*) data)[i].d, 
+                    ((union data_t*) data)[i].d
                 );
                 break;
 
@@ -436,7 +426,7 @@ acct_gather_profile_dataset_t* append_dataset(
     xassert(profile_dataset == NULL);
 
     int current_size = 0;
-    int new_fields = 0
+    int new_fields_size = 0;
 
     acct_gather_profile_dataset_t* iter = dataset;
     while(iter && iter->type != PROFILE_FIELD_NOT_SET){
@@ -446,11 +436,11 @@ acct_gather_profile_dataset_t* append_dataset(
 
     iter = new_fields;
     while(iter && iter->type != PROFILE_FIELD_NOT_SET){
-        new_fields += 1;
+        new_fields_size += 1;
         iter += 1;
     }
 
-    profile_dataset_len = (new_fields + current_size + 1);
+    profile_dataset_len = (new_fields_size + current_size + 1);
     acct_gather_profile_dataset_t* merged = xmalloc(
         sizeof(acct_gather_profile_dataset_t) * profile_dataset_len);
 
@@ -459,14 +449,14 @@ acct_gather_profile_dataset_t* append_dataset(
         merged[i].type = dataset[i].type;
     }
 
-    for(int i = 0; i < new_fields; ++i){
+    for(int i = 0; i < new_fields_size; ++i){
         int j = i + current_size;
 
         merged[j].name = xstrdup(dataset[i].name);
         merged[j].type = dataset[i].type;
     }
 
-    offset = current_size;
+    datasset_offset = current_size;
     profile_dataset = merged;
     return merged;
 }
