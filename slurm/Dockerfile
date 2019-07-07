@@ -26,6 +26,7 @@ ENV PATH /opt/conda/bin:$PATH
 
 RUN apt-get update
 RUN apt-get install -y --no-install-recommends\
+	libcgroup-dev\	
         munge\
         libmunge-dev\
         libmysqlclient-dev\
@@ -37,10 +38,24 @@ RUN apt-get install -y --no-install-recommends\
 	file\
 	python
         
+WORKDIR /workspace
+
 RUN git clone --depth 1 https://github.com/SchedMD/slurm.git
-RUN cd slurm && \ 
-    ./configure && \
+WORKDIR /workspace/slurm
+
+RUN ./configure && \
     make install
+
+WORKDIR /workspace
+
+RUN mkdir -p /etc/slurm
+RUN mkdir -p /var/run/munge
+
+ADD slurm.conf /etc/slurm/slurm.conf
+ADD cgroup.conf /etc/slurm/cgroup.conf
+ADD acct_gather.conf /etc/slurm/acct_gather.conf
+
+ENV SLURM_CONF=/etc/slurm/slurm.conf
 
 # authentication deamon
 # munged
