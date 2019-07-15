@@ -40,7 +40,8 @@ RUN apt-get install -y --no-install-recommends\
         
 WORKDIR /workspace
 
-RUN git clone --depth 1 https://github.com/SchedMD/slurm.git
+#RUN git clone --depth 1 https://github.com/SchedMD/slurm.git
+RUN git clone --depth 1 https://github.com/Delaunay/slurm.git
 WORKDIR /workspace/slurm
 
 RUN ./configure && \
